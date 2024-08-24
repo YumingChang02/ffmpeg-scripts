@@ -1,6 +1,8 @@
 #!/bin/bash
 EXPECTED_ARGS=3
 ARGC=$#
+IGPU_DEV="/dev/dri/renderD128"
+DGPU_DEV="/dev/dri/renderD129"
 
 if [ $ARGC -eq $EXPECTED_ARGS ]; then
     output_path="${3}"
@@ -15,28 +17,31 @@ file_name=$( basename "${1}" )
 FORMAT=$(mediainfo --Inform="Video;%Format%" "${1}")
 echo "Transcoding ${1} from format $FORMAT with quality ${2} to h265; tempfile : /tmp/temp_$random_suffix.mp4; Output Path : $output_path"
 
+IFS=$'\n' arr=($(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of default=nw=1:nk=1 "${1}"))
+
 if [[ $FORMAT =~ "HEVC" ]]; then
     echo "File : ${1} already in HEVC format, skipping ..."
     mv "${1}" "$output_path/$file_name"
 else
-    #flock -x /tmp/.gpu-transcode.lock
-    ffmpeg -y -loglevel error -stats -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi -i "${1}" -c:v hevc_vaapi -rc_mode ICQ -global_quality "${2}" /tmp/temp_"$random_suffix".mp4 # no look_ahead
+    echo "ffmpeg -y -xerror -loglevel error -stats -init_hw_device vaapi=va:$DGPU_DEV -init_hw_device qsv=qs@va -filter_hw_device qs -extra_hw_frames 64 -hwaccel vaapi -hwaccel_output_format vaapi -i ${1} -vf "hwmap=derive_device=qsv,format=qsv" -c:v hevc_qsv -global_quality ${2} /tmp/temp_$random_suffix.mp4"
+    ffmpeg -y -xerror -loglevel error -stats -init_hw_device vaapi=va:$DGPU_DEV -init_hw_device qsv=qs@va -filter_hw_device qs -extra_hw_frames 64 -hwaccel vaapi -hwaccel_output_format vaapi -i "${1}" -vf "hwmap=derive_device=qsv,format=qsv" -c:v hevc_qsv -global_quality ${2} /tmp/temp_"$random_suffix".mp4
     status=$?
     if [ $status -eq 0 ]; then
         if [[ $(stat -c%s /tmp/temp_$random_suffix.mp4) -ge $(stat -c%s "${1}") ]]; then
             du -sh "${1}" && du -sh /tmp/temp_"$random_suffix".mp4
-            flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi -i "${1}" -vf 'hwdownload,format=nv12' -c:v libx265 -crf "${2}" /tmp/temp_"$random_suffix".mp4
+            echo "flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -hwaccel vaapi -hwaccel_device $IGPU_DEV -hwaccel_output_format vaapi -i ${1} -vf 'hwdownload,format=nv12' -vcodec libx265 -crf ${2} /tmp/temp_$random_suffix.mp4"
+            flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -hwaccel vaapi -hwaccel_device $IGPU_DEV -hwaccel_output_format vaapi -i "${1}" -vf 'hwdownload,format=nv12' -vcodec libx265 -crf ${2} /tmp/temp_"$random_suffix".mp4
             status=$?
             if [ $status -ne 0 ]; then
-                echo "${1}" >> /home/markchang/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
+                echo "${1}" >> /tmp/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
                 exit 0
             fi
         fi
         echo "${1}" >> /tmp/success.log
         du -sh "${1}" && du -sh /tmp/temp_"$random_suffix".mp4 && rm "${1}" && mv -v /tmp/temp_"$random_suffix".mp4 "$output_path/${file_name%.*}.mp4"
     else
-        #flock -x /tmp/.cpu-transcode.lock
-        ffmpeg -y -loglevel error -stats -vaapi_device /dev/dri/renderD128 -i "${1}" -vf 'format=nv12,hwupload' -c:v hevc_vaapi -rc_mode ICQ -global_quality "${2}" /tmp/temp_"$random_suffix".mp4 # no look_ahead
+        echo "flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -init_hw_device qsv=hw,child_device=$IGPU_DEV -filter_hw_device hw -i ${1} -vf \"hwupload=extra_hw_frames=64,format=qsv\" -c:v hevc_qsv -global_quality ${2} /tmp/temp_$random_suffix.mp4"
+        flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -init_hw_device qsv=hw,child_device=$IGPU_DEV -filter_hw_device hw -i "${1}" -vf "hwupload=extra_hw_frames=64,format=qsv" -c:v hevc_qsv -global_quality "${2}" /tmp/temp_"$random_suffix".mp4
         status=$?
         if [ $status -eq 0 ]; then
             if [[ $(stat -c%s /tmp/temp_$random_suffix.mp4) -ge $(stat -c%s "${1}") ]]; then
@@ -44,14 +49,14 @@ else
                 flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -i "${1}" -vcodec libx265 -crf "${2}" /tmp/temp_"$random_suffix".mp4
                 status=$?
                 if [ $status -ne 0 ]; then
-                    echo "${1}" >> /home/markchang/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
+                    echo "${1}" >> /tmp/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
                     exit 0
                 fi
             fi
             echo "${1}" >> /tmp/success.log
             du -sh "${1}" && du -sh /tmp/temp_"$random_suffix".mp4 && rm "${1}" && mv -v /tmp/temp_"$random_suffix".mp4 "$output_path/${file_name%.*}.mp4"
         else
-            echo "${1}" >> /home/markchang/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
+            echo "${1}" >> /tmp/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
         fi
     fi
 fi
