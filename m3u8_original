@@ -1,0 +1,12 @@
+#!/bin/bash
+# streamlink --output - --stream-segment-threads 8 "${1}" best | ffmpeg -i - -c copy "${2}"
+echo "downloading -- ${1} ${2}"
+for options in "best" "1080p" "720p"; do
+    echo "Trying resolution $options"
+    streamlink --output - --stream-segment-threads 10 "${1}" $options | ffmpeg -y -stats -loglevel error -init_hw_device qsv=hw,child_device=/dev/dri/renderD129 -filter_hw_device hw -i - -vf "hwupload=extra_hw_frames=64,format=qsv" -c:v hevc_qsv -global_quality 21 "${2}"
+    if [ $? -eq 0 ]; then
+        exit 0
+    else
+        echo "Reducing targets"
+    fi
+done

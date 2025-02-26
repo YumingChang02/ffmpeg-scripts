@@ -51,11 +51,11 @@ else
             fi
             status=$?
             if [ $status -ne 0 ]; then
-                echo "${1}" >> /tmp/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
+                echo "${1}" >> /home/markchang/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
                 exit 0
             fi
         fi
-        echo "${1}" >> /tmp/success.log
+        echo "${1}" >> /home/markchang/storage/.success.log
         du -sh "${1}" && du -sh /tmp/temp_"$random_suffix".mp4 && rm "${1}" && mv -v /tmp/temp_"$random_suffix".mp4 "$output_path/${file_name%.*}.mp4"
     else
         #flock -x /tmp/.cpu-transcode.lock
@@ -77,14 +77,14 @@ else
                 fi
                 status=$?
                 if [ $status -ne 0 ]; then
-                    echo "${1}" >> /tmp/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
+                    echo "${1}" >> /home/markchang/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
                     exit 0
                 fi
             fi
-            echo "${1}" >> /tmp/success.log
+            echo "${1}" >> /home/markchang/storage/.success.log
             du -sh "${1}" && du -sh /tmp/temp_"$random_suffix".mp4 && rm "${1}" && mv -v /tmp/temp_"$random_suffix".mp4 "$output_path/${file_name%.*}.mp4"
         else
-            echo "${1}" >> /tmp/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
+            echo "${1}" >> /home/markchang/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
         fi
     fi
 fi

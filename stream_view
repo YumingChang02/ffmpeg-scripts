@@ -1,0 +1,4 @@
+#!/bin/bash
+TIME=${1}
+sudo bash -c "clear; date -d ${TIME}minute; sleep ${TIME}m; date; usbreset 002/002" && \
+ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi -input_format mjpeg -f v4l2 -i /dev/video0 -f alsa -i hw:1 -t ${2} -vf 'scale_vaapi=format=nv12' -c:v h264_vaapi -qp 20 -c:a aac -b:a 128k -f rtsp rtsp://192.168.18.95:8554/stream
