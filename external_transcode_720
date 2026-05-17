@@ -1,90 +1,148 @@
 #!/bin/bash
-EXPECTED_ARGS=3
+EXPECTED_ARGS=2
 ARGC=$#
-IGPU_DEV="/dev/dri/renderD128"
-DGPU_DEV="/dev/dri/renderD129"
 
-if [ $ARGC -eq $EXPECTED_ARGS ]; then
-    output_path="${3}"
-else
-    if [ $ARGC -lt $EXPECTED_ARGS ]; then
-        output_path="$(pwd)"
-    fi
+if [ $ARGC -lt $EXPECTED_ARGS ]; then
+    echo "Usage: $0 <input_file> <quality> [output_path]"
+    exit 1
 fi
 
-random_suffix=$( echo $RANDOM | md5sum | head -c 20 )
-file_name=$( basename "${1}" )
-FORMAT=$(mediainfo --Inform="Video;%Format%" "${1}")
-echo "Transcoding ${1} from format $FORMAT with quality ${2} to h265; tempfile : /tmp/temp_$random_suffix.mp4; Output Path : $output_path"
+INPUT_FILE="${1}"
+QUALITY="${2}"
+OUTPUT_PATH="${3:-$(pwd)}"
 
-IFS=$'\n' arr=($(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of default=nw=1:nk=1 "${1}"))
-#RESIZE=true #BUG https://trac.ffmpeg.org/ticket/10856
-if [[ ${arr[0]} -gt 1280 && ${arr[1]} -gt 720 ]]; then
-    echo "Resolution: ${arr[0]} x ${arr[1]}, setting resize parameter"
+IGPU_DEV="/dev/dri/renderD128"
+DGPU_DEV="/dev/dri/renderD128"
+
+random_suffix=$(echo $RANDOM | md5sum | head -c 20)
+file_name=$(basename "$INPUT_FILE")
+FORMAT=$(mediainfo --Inform="Video;%Format%" "$INPUT_FILE")
+
+echo "========================================================="
+echo "Transcoding : $INPUT_FILE"
+echo "Format      : $FORMAT"
+echo "Quality     : $QUALITY"
+echo "Output Path : $OUTPUT_PATH"
+echo "========================================================="
+
+# --- 1. HEVC Check ---
+if [[ "$FORMAT" =~ "HEVC" ]]; then
+    echo "File : $INPUT_FILE is already in HEVC format, skipping..."
+    mv "$INPUT_FILE" "$OUTPUT_PATH/$file_name"
+    exit 0
+fi
+
+# --- 2. Resolution & Resize Logic ---
+# Save the original IFS
+OLD_IFS="$IFS"
+
+# Change it just to parse ffprobe
+IFS=$'\n'
+arr=($(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of default=nw=1:nk=1 "$INPUT_FILE"))
+
+# Restore the original IFS immediately!
+IFS="$OLD_IFS"
+
+WIDTH=${arr[0]}
+HEIGHT=${arr[1]}
+RESIZE=false
+
+if [[ "$WIDTH" -gt 1280 && "$HEIGHT" -gt 720 ]]; then
+    echo "Resolution: $WIDTH x $HEIGHT -> Setting resize parameter (Max 720p)"
     RESIZE=true
 else
-    echo "Resolution: ${arr[0]} x ${arr[1]}"
-    RESIZE=false
+    echo "Resolution: $WIDTH x $HEIGHT -> No scaling required"
 fi
 
-if [[ $FORMAT =~ "HEVC" ]]; then
-    echo "File : ${1} already in HEVC format, skipping ..."
-    mv "${1}" "$output_path/$file_name"
+TEMP_FILE="/tmp/temp_${random_suffix}.mp4"
+
+# Pre-define filters based on the RESIZE variable to keep FFmpeg commands clean
+if [ "$RESIZE" = true ]; then
+    VF_FULL_HW="hwmap=derive_device=qsv,format=qsv,scale_qsv=w=1280:h=-1:mode=hq"
+    VF_SW_HW="scale='min(1280,iw)':-1,hwupload=extra_hw_frames=64,format=qsv"
+    HB_RESIZE="--width 1280"
 else
-    if [ "$RESIZE" = true ]; then
-         echo "ffmpeg -y -xerror -loglevel error -stats -init_hw_device vaapi=va:$DGPU_DEV -init_hw_device qsv=qs@va -filter_hw_device qs -extra_hw_frames 64 -hwaccel vaapi -hwaccel_output_format vaapi -i ${1} -vf "hwmap=derive_device=qsv,format=qsv,scale_qsv=w=1280:h=-1:mode=hq" -c:v hevc_qsv -global_quality ${2} /tmp/temp_$random_suffix.mp4"
-         ffmpeg -y -xerror -loglevel error -stats -init_hw_device vaapi=va:$DGPU_DEV -init_hw_device qsv=qs@va -filter_hw_device qs -extra_hw_frames 64 -hwaccel vaapi -hwaccel_output_format vaapi -i "${1}" -vf "hwmap=derive_device=qsv,format=qsv,scale_qsv=w=1280:h=-1:mode=hq" -c:v hevc_qsv -global_quality ${2} /tmp/temp_"$random_suffix".mp4
+    VF_FULL_HW="hwmap=derive_device=qsv,format=qsv"
+    VF_SW_HW="hwupload=extra_hw_frames=64,format=qsv"
+    HB_RESIZE=""
+fi
+
+transcode_success=false
+
+# --- ATTEMPT 1: FFmpeg Full Hardware (VAAPI Decode -> QSV Encode) ---
+echo ">>> Attempt 1: FFmpeg Full Hardware Transcode"
+ffmpeg -y -xerror -loglevel error -stats \
+    -init_hw_device vaapi=va:$DGPU_DEV -init_hw_device qsv=qs@va -filter_hw_device qs -extra_hw_frames 64 \
+    -hwaccel vaapi -hwaccel_output_format vaapi \
+    -i "$INPUT_FILE" -vf "$VF_FULL_HW" \
+    -c:v hevc_qsv -look_ahead 1 -look_ahead_depth 40 -global_quality "$QUALITY" \
+    "$TEMP_FILE"
+
+if [ $? -eq 0 ]; then
+    transcode_success=true
+else
+    echo ">>> Attempt 1 Failed. Falling back to Attempt 2..."
+    rm -f "$TEMP_FILE"
+
+    # --- ATTEMPT 2: FFmpeg Software Decode -> Hardware Encode (QSV) ---
+    # echo ">>> Attempt 2: FFmpeg Software Decode + HW Encode"
+    # ffmpeg -y -xerror -loglevel error -stats \
+    #     -init_hw_device qsv=hw,child_device=$IGPU_DEV -filter_hw_device hw \
+    #     -i "$INPUT_FILE" -vf "$VF_SW_HW" \
+    #     -c:v hevc_qsv -look_ahead 1 -look_ahead_depth 40 -global_quality "$QUALITY" \
+    #     "$TEMP_FILE"
+
+    # if [ $? -eq 0 ]; then
+    #     transcode_success=true
+    # else
+    # echo ">>> Attempt 2 Failed. Falling back to Attempt 3..."
+    # rm -f "$TEMP_FILE"
+
+    # --- ATTEMPT 3: HandBrakeCLI (QSV Hardware Encode) ---
+    echo ">>> Attempt 2: HandBrakeCLI (Hardware QSV)"
+    # Note: HandBrake auto-handles SW decode -> HW encode gracefully
+    HandBrakeCLI -i "$INPUT_FILE" -o "$TEMP_FILE" -e qsv_h265 -q "$QUALITY" $HB_RESIZE -x "lookahead=1:lookahead_depth=40"
+
+    if [ $? -eq 0 ]; then
+        transcode_success=true
     else
-         echo "ffmpeg -y -xerror -loglevel error -stats -init_hw_device vaapi=va:$DGPU_DEV -init_hw_device qsv=qs@va -filter_hw_device qs -extra_hw_frames 64 -hwaccel vaapi -hwaccel_output_format vaapi -i ${1} -vf "hwmap=derive_device=qsv,format=qsv" -c:v hevc_qsv -global_quality ${2} /tmp/temp_$random_suffix.mp4"
-         ffmpeg -y -xerror -loglevel error -stats -init_hw_device vaapi=va:$DGPU_DEV -init_hw_device qsv=qs@va -filter_hw_device qs -extra_hw_frames 64 -hwaccel vaapi -hwaccel_output_format vaapi -i "${1}" -vf "hwmap=derive_device=qsv,format=qsv" -c:v hevc_qsv -global_quality ${2} /tmp/temp_"$random_suffix".mp4
+        echo ">>> Attempt 2 Failed."
     fi
-    status=$?
-    if [ $status -eq 0 ]; then
-        if [[ $(stat -c%s /tmp/temp_$random_suffix.mp4) -ge $(stat -c%s "${1}") ]]; then
-            du -sh "${1}" && du -sh /tmp/temp_"$random_suffix".mp4
-            if [ "$RESIZE" = true ]; then
-                echo "flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -hwaccel vaapi -hwaccel_device $IGPU_DEV -hwaccel_output_format vaapi -i ${1} -vf 'scale_vaapi=w=1280:h=-1,hwdownload,format=nv12' -vcodec libx265 -crf ${2} /tmp/temp_$random_suffix.mp4"
-                flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -hwaccel vaapi -hwaccel_device $IGPU_DEV -hwaccel_output_format vaapi -i "${1}" -vf 'scale_vaapi=w=1280:h=-1,hwdownload,format=nv12' -vcodec libx265 -crf ${2} /tmp/temp_"$random_suffix".mp4
-            else
-                echo "flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -hwaccel vaapi -hwaccel_device $IGPU_DEV -hwaccel_output_format vaapi -i ${1} -vf 'hwdownload,format=nv12' -vcodec libx265 -crf ${2} /tmp/temp_$random_suffix.mp4"
-                flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -hwaccel vaapi -hwaccel_device $IGPU_DEV -hwaccel_output_format vaapi -i "${1}" -vf 'hwdownload,format=nv12' -vcodec libx265 -crf ${2} /tmp/temp_"$random_suffix".mp4
-            fi
-            status=$?
-            if [ $status -ne 0 ]; then
-                echo "${1}" >> /home/markchang/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
-                exit 0
-            fi
-        fi
-        echo "${1}" >> /home/markchang/storage/.success.log
-        du -sh "${1}" && du -sh /tmp/temp_"$random_suffix".mp4 && rm "${1}" && mv -v /tmp/temp_"$random_suffix".mp4 "$output_path/${file_name%.*}.mp4"
-    else
-        #flock -x /tmp/.cpu-transcode.lock
-        if [ "$RESIZE" = true ]; then
-            echo "flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -init_hw_device qsv=hw,child_device=$IGPU_DEV -filter_hw_device hw -i ${1} -vf \"scale='min(1280,iw)':-1,hwupload=extra_hw_frames=64,format=qsv\" -c:v hevc_qsv -global_quality ${2} /tmp/temp_$random_suffix.mp4"
-            flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -init_hw_device qsv=hw,child_device=$IGPU_DEV -filter_hw_device hw -i "${1}" -vf "scale='min(1280,iw)':-1,hwupload=extra_hw_frames=64,format=qsv" -c:v hevc_qsv -global_quality "${2}" /tmp/temp_"$random_suffix".mp4
-        else
-            echo "flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -init_hw_device qsv=hw,child_device=$IGPU_DEV -filter_hw_device hw -i ${1} -vf \"hwupload=extra_hw_frames=64,format=qsv\" -c:v hevc_qsv -global_quality ${2} /tmp/temp_$random_suffix.mp4"
-            flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -init_hw_device qsv=hw,child_device=$IGPU_DEV -filter_hw_device hw -i "${1}" -vf "hwupload=extra_hw_frames=64,format=qsv" -c:v hevc_qsv -global_quality "${2}" /tmp/temp_"$random_suffix".mp4
-        fi
-        status=$?
-        if [ $status -eq 0 ]; then
-            if [[ $(stat -c%s /tmp/temp_$random_suffix.mp4) -ge $(stat -c%s "${1}") ]]; then
-                du -sh "${1}" && du -sh /tmp/temp_"$random_suffix".mp4
-                if [ "$RESIZE" = true ]; then
-                    flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -i "${1}" -vcodec libx265 -vf "scale='min(1280,iw)':-1" -crf "${2}" /tmp/temp_"$random_suffix".mp4
-                else
-                    flock -x /tmp/.cpu-transcode.lock ffmpeg -y -stats -xerror -loglevel error -i "${1}" -vcodec libx265 -crf "${2}" /tmp/temp_"$random_suffix".mp4
-                fi
-                status=$?
-                if [ $status -ne 0 ]; then
-                    echo "${1}" >> /home/markchang/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
-                    exit 0
-                fi
-            fi
-            echo "${1}" >> /home/markchang/storage/.success.log
-            du -sh "${1}" && du -sh /tmp/temp_"$random_suffix".mp4 && rm "${1}" && mv -v /tmp/temp_"$random_suffix".mp4 "$output_path/${file_name%.*}.mp4"
-        else
-            echo "${1}" >> /home/markchang/failed.log && rm -v /tmp/temp_"$random_suffix".mp4 "${1}"
+    # fi
+fi
+
+# --- Post-Processing & Validation ---
+if [ "$transcode_success" = true ]; then
+    ORIGINAL_SIZE=$(stat -c%s "$INPUT_FILE")
+    NEW_SIZE=$(stat -c%s "$TEMP_FILE")
+
+    # If the HW transcoded file is larger than the original, run CPU fallback
+    if [[ $NEW_SIZE -ge $ORIGINAL_SIZE ]]; then
+        echo ">>> Warning: Transcoded file is larger than original. Running HandBrake CPU x265 fallback..."
+        rm -f "$TEMP_FILE"
+
+        # Using your original file locking for CPU resources
+        flock -x /tmp/.cpu-transcode.lock HandBrakeCLI -i "$INPUT_FILE" -o "$TEMP_FILE" -e x265 -q "$QUALITY" $HB_RESIZE
+
+        if [ $? -ne 0 ]; then
+            echo ">>> CPU Transcode Failed."
+            echo "$INPUT_FILE" >> /home/markchang/failed.log
+            rm -v -f "$TEMP_FILE" "$INPUT_FILE"
+            exit 0
         fi
     fi
+
+    # Final Success Actions
+    echo "$INPUT_FILE" >> /home/markchang/storage/.success.log
+    du -sh "$INPUT_FILE" && du -sh "$TEMP_FILE"
+    rm -f "$INPUT_FILE"
+    mv -v "$TEMP_FILE" "$OUTPUT_PATH/${file_name%.*}.mp4"
+    exit 0
+
+else
+    # All hardware and software transcode attempts failed
+    echo ">>> Error: All transcode attempts failed."
+    echo "$INPUT_FILE" >> /home/markchang/failed.log
+    rm -v -f "$TEMP_FILE" "$INPUT_FILE"
+    exit 0
 fi
